@@ -4,6 +4,8 @@ import re
 import os
 import hashlib
 import json
+import calendar
+from copy import copy
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
@@ -16,6 +18,12 @@ MESES_PT = {
     1: "Janeiro", 2: "Fevereiro", 3: "Março", 4: "Abril",
     5: "Maio", 6: "Junho", 7: "Julho", 8: "Agosto",
     9: "Setembro", 10: "Outubro", 11: "Novembro", 12: "Dezembro",
+}
+
+MESES_PT_UPPER = {
+    "JANEIRO": 1, "FEVEREIRO": 2, "MARÇO": 3, "MARCO": 3, "ABRIL": 4,
+    "MAIO": 5, "JUNHO": 6, "JULHO": 7, "AGOSTO": 8,
+    "SETEMBRO": 9, "OUTUBRO": 10, "NOVEMBRO": 11, "DEZEMBRO": 12,
 }
 
 COR_HEADER_BG = "0F1B2D"
@@ -31,15 +39,10 @@ COR_BORDA = "CBD5E1"
 # ═══════════════════════════════════════════
 # CONFIGURAÇÃO DE USUÁRIOS
 # ═══════════════════════════════════════════
-# Para adicionar novos usuários, basta incluir no dicionário abaixo.
-# A senha é armazenada como hash SHA-256 para segurança básica.
-# Para gerar o hash de uma nova senha, use:
-#   python -c "import hashlib; print(hashlib.sha256('sua_senha'.encode()).hexdigest())"
 
 def _hash_senha(senha):
     return hashlib.sha256(senha.encode()).hexdigest()
 
-# Usuários padrão — altere as senhas antes de usar em produção!
 USUARIOS = {
     "mvtec2026": {
         "senha_hash": _hash_senha("MV@@2026"),
@@ -494,7 +497,7 @@ def _gerar_relatorio(ws_origem, linhas_quitadas, mes, ano):
 
 
 # ═══════════════════════════════════════════
-# FUNÇÕES DE PROCESSAMENTO
+# FUNÇÕES DE PROCESSAMENTO (PARCELAS)
 # ═══════════════════════════════════════════
 
 def processar_planilha(caminho_entrada, mes, ano):
@@ -574,7 +577,374 @@ def processar_planilha_coluna_f(caminho_entrada, mes, ano):
 
 
 # ═══════════════════════════════════════════
-# COMPONENTE DE PROCESSAMENTO
+# FUNÇÕES - CONTA AZUL (FLUXO DE CAIXA)
+# ═══════════════════════════════════════════
+
+def _parse_valor_br(valor_str):
+    """Converte valor no formato brasileiro '1.234,56' para float."""
+    if valor_str is None:
+        return 0.0
+    s = str(valor_str).strip()
+    if s == "" or s == "0" or s == "-":
+        return 0.0
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def _ler_fluxo_csv(arquivo_bytes, nome_arquivo):
+    """
+    Lê um CSV de fluxo de caixa do Conta Azul e retorna dict {dia: (recebimentos, pagamentos)}.
+    """
+    conteudo = None
+    for enc in ['utf-8', 'latin1', 'cp1252', 'iso-8859-1']:
+        try:
+            conteudo = arquivo_bytes.decode(enc)
+            break
+        except (UnicodeDecodeError, AttributeError):
+            continue
+
+    if conteudo is None:
+        raise ValueError(f"Não foi possível decodificar o arquivo {nome_arquivo}")
+
+    linhas = conteudo.replace('\r\n', '\n').replace('\r', '\n').strip().split('\n')
+    if not linhas:
+        raise ValueError(f"Arquivo {nome_arquivo} está vazio")
+
+    header = linhas[0]
+    sep = ';' if header.count(';') >= header.count(',') else ','
+
+    colunas = [c.strip().strip('"') for c in header.split(sep)]
+
+    idx_data = None
+    idx_recebimentos = None
+    idx_pagamentos = None
+
+    for i, col in enumerate(colunas):
+        col_norm = col.lower().strip()
+        if idx_data is None and 'data' in col_norm:
+            idx_data = i
+        if idx_recebimentos is None and 'recebimento' in col_norm:
+            idx_recebimentos = i
+        if idx_pagamentos is None and 'pagamento' in col_norm:
+            idx_pagamentos = i
+
+    if idx_data is None or idx_recebimentos is None or idx_pagamentos is None:
+        raise ValueError(
+            f"Arquivo '{nome_arquivo}': colunas obrigatórias não encontradas.\n"
+            f"Esperado: Data, Recebimentos, Pagamentos.\n"
+            f"Encontrado: {colunas}"
+        )
+
+    dados_por_dia = {}
+
+    for linha in linhas[1:]:
+        if not linha.strip():
+            continue
+
+        campos = [c.strip().strip('"') for c in linha.split(sep)]
+        if len(campos) <= max(idx_data, idx_recebimentos, idx_pagamentos):
+            continue
+
+        data_str = campos[idx_data].strip()
+        receb_str = campos[idx_recebimentos].strip()
+        pagam_str = campos[idx_pagamentos].strip()
+
+        try:
+            partes = data_str.split('/')
+            dia = int(partes[0])
+            if dia < 1 or dia > 31:
+                continue
+        except (ValueError, IndexError):
+            continue
+
+        receb = _parse_valor_br(receb_str)
+        pagam = _parse_valor_br(pagam_str)
+
+        if dia in dados_por_dia:
+            r_ant, p_ant = dados_por_dia[dia]
+            dados_por_dia[dia] = (r_ant + receb, p_ant + pagam)
+        else:
+            dados_por_dia[dia] = (receb, pagam)
+
+    return dados_por_dia
+
+
+def _copiar_estilo(origem, destino):
+    """Copia estilo (font, fill, alignment, border, number_format) de uma célula para outra."""
+    if origem.font:
+        destino.font = copy(origem.font)
+    if origem.fill:
+        destino.fill = copy(origem.fill)
+    if origem.alignment:
+        destino.alignment = copy(origem.alignment)
+    if origem.border:
+        destino.border = copy(origem.border)
+    if origem.number_format:
+        destino.number_format = origem.number_format
+
+
+def processar_conta_azul(caminho_receitas, arquivos_fluxo, mes_selecionado, ano_selecionado):
+    """
+    Consolida os CSVs de fluxo de caixa do Conta Azul e preenche a planilha de Receitas.
+
+    Comportamento:
+      - Cria apenas uma linha por dia que possui valores nos CSVs (receita ou despesa > 0)
+      - Mantém a mesclagem B1:E1 do título exatamente como no template
+      - Linha de TOTAL com mesclagem dupla (2 linhas) igual ao template
+      - 4 linhas de assinatura preservadas do template
+    """
+    from copy import copy as _copy
+
+    # ── 1. Consolidar todos os CSVs ──────────────────────────────────────
+    dados_consolidados = {}  # {dia: (total_receb, total_pagam)}
+
+    for nome, conteudo_bytes in arquivos_fluxo:
+        dados = _ler_fluxo_csv(conteudo_bytes, nome)
+        for dia, (receb, pagam) in dados.items():
+            if dia in dados_consolidados:
+                r_ant, p_ant = dados_consolidados[dia]
+                dados_consolidados[dia] = (r_ant + receb, p_ant + pagam)
+            else:
+                dados_consolidados[dia] = (receb, pagam)
+
+    # Filtrar apenas dias que têm pelo menos receita ou despesa > 0
+    dias_com_dados = sorted(
+        dia for dia, (r, p) in dados_consolidados.items() if r > 0 or p > 0
+    )
+
+    # ── 2. Abrir planilha de receitas ────────────────────────────────────
+    wb = load_workbook(caminho_receitas)
+
+    nome_mes_upper = MESES_PT.get(mes_selecionado, str(mes_selecionado)).upper()
+    nome_aba_destino = f"rec desp {mes_selecionado:02d}.{ano_selecionado}"
+
+    # ── 3. Localizar template de formatação ─────────────────────────────
+    aba_template = None
+    for nome_aba in wb.sheetnames:
+        n = nome_aba.strip().lower()
+        if n.startswith("rec desp") and nome_aba.strip() != nome_aba_destino:
+            aba_template = wb[nome_aba]
+            break
+
+    # ── 4. Criar ou limpar a aba de destino ──────────────────────────────
+    if nome_aba_destino in wb.sheetnames:
+        del wb[nome_aba_destino]
+
+    nome_aba_mes = f"{nome_mes_upper} {ano_selecionado}"
+    posicao_insercao = 0
+    for i, nome_aba in enumerate(wb.sheetnames):
+        if nome_aba.strip().upper() == nome_aba_mes:
+            posicao_insercao = i + 1
+            break
+
+    ws = wb.create_sheet(title=nome_aba_destino, index=posicao_insercao)
+
+    # ── 5. Copiar dimensões de colunas e linhas do template ───────────────
+    if aba_template:
+        for col_letter, col_dim in aba_template.column_dimensions.items():
+            ws.column_dimensions[col_letter].width = col_dim.width
+        for row_num in range(1, 42):
+            rd_orig = aba_template.row_dimensions[row_num]
+            if rd_orig.height:
+                ws.row_dimensions[row_num].height = rd_orig.height
+    else:
+        ws.column_dimensions['A'].width = 5.8
+        ws.column_dimensions['B'].width = 18.7
+        ws.column_dimensions['C'].width = 20.0
+        ws.column_dimensions['D'].width = 20.2
+        ws.column_dimensions['E'].width = 18.5
+        ws.row_dimensions[1].height = 38.5
+        ws.row_dimensions[2].height = 21.5
+        ws.row_dimensions[3].height = 4.5
+        ws.row_dimensions[4].height = 57.75
+
+    # ── 6. Linha 1: título mesclado B1:E1 (idêntico ao template) ─────────
+    ws.merge_cells('B1:E1')
+    cell_titulo = ws.cell(row=1, column=2,
+        value="PROVISÃO DE RECEITAS E DESPESAS DIÁRIAS\n MV CONTABILIDADE")
+    if aba_template:
+        _copiar_estilo(aba_template.cell(row=1, column=2), cell_titulo)
+    else:
+        cell_titulo.font = Font(bold=True, size=12)
+        cell_titulo.fill = PatternFill("solid", fgColor="DAEEF3")
+        cell_titulo.alignment = Alignment(wrap_text=True, horizontal="center", vertical="center")
+
+    # ── 7. Linha 2: mês e ano ─────────────────────────────────────────────
+    cell_mes = ws.cell(row=2, column=3, value=f"{nome_mes_upper} ")
+    cell_ano = ws.cell(row=2, column=4, value=ano_selecionado)
+    if aba_template:
+        _copiar_estilo(aba_template.cell(row=2, column=3), cell_mes)
+        _copiar_estilo(aba_template.cell(row=2, column=4), cell_ano)
+    else:
+        for c in [cell_mes, cell_ano]:
+            c.font = Font(bold=True)
+            c.fill = PatternFill("solid", fgColor="DAEEF3")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+
+    # Linha 3: espaço vazio
+    ws.row_dimensions[3].height = 4.5
+
+    # ── 8. Linha 4: headers ───────────────────────────────────────────────
+    headers = {2: "DATA DE VENCIMENTO", 3: "RECEITAS", 4: "DESPESAS", 5: "SALDO"}
+    for col, texto in headers.items():
+        cell = ws.cell(row=4, column=col, value=texto)
+        if aba_template:
+            _copiar_estilo(aba_template.cell(row=4, column=col), cell)
+        else:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="F0F8FA")
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # ── 9. Linhas de dados: apenas dias com valores nos CSVs ─────────────
+    _fmt_data   = 'DD/MM/YYYY'
+    _fmt_valor  = '#,##0.00'
+    _align_valor = Alignment(horizontal="right", vertical="center")
+
+    # Estilos de referência da linha de dados do template (linha 5)
+    _font_data  = _copy(aba_template.cell(row=5, column=2).font) if aba_template else Font(size=10)
+    _align_data = _copy(aba_template.cell(row=5, column=2).alignment) if aba_template \
+                  else Alignment(horizontal="center", vertical="center")
+
+    total_receitas = 0.0
+    total_despesas = 0.0
+    primeira_linha_dados = 5
+    linha_atual = primeira_linha_dados
+
+    for dia in dias_com_dados:
+        receb, pagam = dados_consolidados[dia]
+
+        # Validar que o dia existe no mês selecionado
+        dias_no_mes = calendar.monthrange(ano_selecionado, mes_selecionado)[1]
+        if dia > dias_no_mes:
+            continue
+
+        nova_data = datetime(ano_selecionado, mes_selecionado, dia)
+
+        # Copiar estilo base do template (linha 5 como referência)
+        if aba_template:
+            for col in [2, 3, 4, 5]:
+                src = aba_template.cell(row=5, column=col)
+                dst = ws.cell(row=linha_atual, column=col)
+                if src.font:
+                    dst.font = _copy(src.font)
+                if src.fill and src.fill.patternType:
+                    dst.fill = _copy(src.fill)
+                if src.border:
+                    dst.border = _copy(src.border)
+
+        # Data
+        cell_data = ws.cell(row=linha_atual, column=2, value=nova_data)
+        cell_data.number_format = _fmt_data
+        cell_data.font = _font_data
+        cell_data.alignment = _align_data
+
+        # Receitas
+        cell_rec = ws.cell(row=linha_atual, column=3, value=receb)
+        cell_rec.number_format = _fmt_valor
+        cell_rec.alignment = _align_valor
+
+        # Despesas
+        cell_desp = ws.cell(row=linha_atual, column=4, value=pagam)
+        cell_desp.number_format = _fmt_valor
+        cell_desp.alignment = _align_valor
+
+        # Saldo (fórmula =C-D)
+        cell_saldo = ws.cell(row=linha_atual, column=5, value=f"=C{linha_atual}-D{linha_atual}")
+        cell_saldo.number_format = _fmt_valor
+        cell_saldo.alignment = _align_valor
+
+        ws.row_dimensions[linha_atual].height = 14.5
+
+        total_receitas += receb
+        total_despesas += pagam
+        linha_atual += 1
+
+    ultima_linha_dados = linha_atual - 1  # última linha que tem dado
+
+    # ── 10. Linha de TOTAL — mesclada em 2 linhas (B:E), igual ao template ─
+    linha_total = linha_atual  # primeira linha do bloco total
+    linha_total2 = linha_atual + 1  # segunda linha do bloco (mesclagem)
+
+    # Mesclar cada coluna verticalmente (2 linhas) como no template: B35:B36 etc.
+    for col_letra in ['B', 'C', 'D', 'E']:
+        ws.merge_cells(f"{col_letra}{linha_total}:{col_letra}{linha_total2}")
+
+    # Se não há dados, fórmula SUM vazia
+    ref_inicio = primeira_linha_dados
+    ref_fim = ultima_linha_dados if ultima_linha_dados >= primeira_linha_dados else primeira_linha_dados
+
+    cell_lbl   = ws.cell(row=linha_total, column=2, value="TOTAL")
+    cell_sum_c = ws.cell(row=linha_total, column=3, value=f"=SUM(C{ref_inicio}:C{ref_fim})")
+    cell_sum_d = ws.cell(row=linha_total, column=4, value=f"=SUM(D{ref_inicio}:D{ref_fim})")
+    cell_sum_e = ws.cell(row=linha_total, column=5, value=f"=SUM(E{ref_inicio}:E{ref_fim})")
+
+    for cell in [cell_lbl, cell_sum_c, cell_sum_d, cell_sum_e]:
+        cell.number_format = _fmt_valor
+    if aba_template:
+        for col, cell in zip([2, 3, 4, 5], [cell_lbl, cell_sum_c, cell_sum_d, cell_sum_e]):
+            src = aba_template.cell(row=35, column=col)
+            if src.font:
+                cell.font = _copy(src.font)
+            if src.fill and src.fill.patternType:
+                cell.fill = _copy(src.fill)
+            if src.border:
+                cell.border = _copy(src.border)
+            if src.alignment:
+                cell.alignment = _copy(src.alignment)
+        # Reaplica valores após cópia de estilo
+        ws.cell(row=linha_total, column=2).value = "TOTAL"
+        ws.cell(row=linha_total, column=3).value = f"=SUM(C{ref_inicio}:C{ref_fim})"
+        ws.cell(row=linha_total, column=4).value = f"=SUM(D{ref_inicio}:D{ref_fim})"
+        ws.cell(row=linha_total, column=5).value = f"=SUM(E{ref_inicio}:E{ref_fim})"
+    else:
+        for cell in [cell_lbl, cell_sum_c, cell_sum_d, cell_sum_e]:
+            cell.font = Font(bold=True)
+    ws.row_dimensions[linha_total].height = 15.0
+    ws.row_dimensions[linha_total2].height = 15.0
+
+    # ── 11. Assinaturas: 4 linhas após o bloco de TOTAL ──────────────────
+    # No template ficam nas linhas 36–39 (4 linhas abaixo de 35).
+    # Aqui posicionamos nas 4 linhas seguintes ao bloco de total.
+    offset_assinatura = linha_total2 + 1  # começa 1 linha após o fim do total
+
+    if aba_template:
+        # Copiar as 4 linhas de assinatura do template (linhas 36–39)
+        for i in range(4):
+            linha_orig = 36 + i
+            linha_dest = offset_assinatura + i
+            for col in range(1, 7):
+                src = aba_template.cell(row=linha_orig, column=col)
+                dst = ws.cell(row=linha_dest, column=col)
+                if src.value is not None:
+                    dst.value = src.value
+                if src.font:
+                    dst.font = _copy(src.font)
+                if src.fill and src.fill.patternType:
+                    dst.fill = _copy(src.fill)
+                if src.border:
+                    dst.border = _copy(src.border)
+                if src.alignment:
+                    dst.alignment = _copy(src.alignment)
+            # Copiar altura da linha
+            rd = aba_template.row_dimensions[linha_orig]
+            if rd.height:
+                ws.row_dimensions[linha_dest].height = rd.height
+
+    # ── 12. Salvar ────────────────────────────────────────────────────────
+    pasta = os.path.dirname(caminho_receitas)
+    nome_base = os.path.splitext(os.path.basename(caminho_receitas))[0]
+    nome_mes_arquivo = MESES_PT.get(mes_selecionado, str(mes_selecionado))
+    saida = os.path.join(pasta, f"{nome_base}_{nome_mes_arquivo}_{ano_selecionado}.xlsx")
+    wb.save(saida)
+
+    return saida, len(dias_com_dados), total_receitas, total_despesas
+
+
+# ═══════════════════════════════════════════
+# COMPONENTE DE PROCESSAMENTO (PARCELAS)
 # ═══════════════════════════════════════════
 
 def bloco_processamento(key_prefix, descricao, funcao_processar):
@@ -655,6 +1025,144 @@ def bloco_processamento(key_prefix, descricao, funcao_processar):
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
+
+
+# ═══════════════════════════════════════════
+# COMPONENTE CONTA AZUL
+# ═══════════════════════════════════════════
+
+def bloco_conta_azul():
+    st.markdown(
+        '<p style="font-size:0.88rem; color: var(--mv-muted, #64748b); margin-bottom: 1rem;">'
+        'Anexe os <strong>CSVs de Fluxo de Caixa Diário</strong> exportados do Conta Azul e a '
+        '<strong>planilha de Receitas (.xlsx)</strong>. Os <em>Recebimentos</em> de cada dia '
+        '(col B do CSV) serão somados e inseridos em <strong>Receitas</strong> (col C), e os '
+        '<em>Pagamentos</em> (col C do CSV) em <strong>Despesas</strong> (col D) da planilha. '
+        'Apenas dias com valores são incluídos.</p>',
+        unsafe_allow_html=True,
+    )
+
+    arquivos_fluxo = st.file_uploader(
+        "📂 Planilhas de Fluxo de Caixa Diário (.csv)",
+        type=['csv'],
+        key="ca_fluxo_uploader",
+        accept_multiple_files=True,
+        help="Exporte do Conta Azul: Relatórios → Fluxo de Caixa Diário → CSV"
+    )
+
+    arquivo_receitas = st.file_uploader(
+        "📋 Planilha de Receitas e Despesas (.xlsx)",
+        type=['xlsx'],
+        key="ca_receitas_uploader",
+        help="A planilha com abas mensais (ex: '2-_Receitas_MV.xlsx'). "
+             "Os dados serão inseridos em uma nova aba 'rec desp MM.AAAA'."
+    )
+
+    if arquivos_fluxo:
+        for arq in arquivos_fluxo:
+            st.markdown(
+                f'<div style="display:flex;align-items:center;gap:8px;padding:6px 14px;'
+                f'background:rgba(59,130,246,0.06);border-radius:10px;margin:0.2rem 0;">'
+                f'<span style="font-size:1rem;">📄</span>'
+                f'<span style="color:#2563eb;font-weight:500;font-size:0.85rem;">{arq.name}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    if arquivo_receitas:
+        st.markdown(
+            f'<div style="display:flex;align-items:center;gap:8px;padding:8px 14px;'
+            f'background:rgba(16,185,129,0.08);border-radius:10px;margin:0.3rem 0;">'
+            f'<span style="font-size:1.15rem;">📎</span>'
+            f'<span style="color:#059669;font-weight:500;font-size:0.9rem;">{arquivo_receitas.name}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    if not arquivos_fluxo or not arquivo_receitas:
+        st.markdown(
+            '<p style="text-align:center; color: var(--text-muted); padding: 1.5rem 0; opacity: 0.6;">'
+            'Anexe pelo menos um CSV de Fluxo de Caixa e a planilha de Receitas para continuar</p>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        mes = st.number_input(
+            "Mês de referência", min_value=1, max_value=12,
+            value=datetime.now().month, step=1, key="ca_mes"
+        )
+    with col2:
+        ano = st.number_input(
+            "Ano de referência", min_value=2020, max_value=2035,
+            value=datetime.now().year, step=1, key="ca_ano"
+        )
+
+    nome_aba_preview = f"rec desp {mes:02d}.{ano}"
+    st.markdown(
+        f'<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.15);'
+        f'border-radius:10px;padding:10px 16px;margin:0.8rem 0;">'
+        f'<span style="color:#64748b;font-size:0.82rem;">Aba que será criada/atualizada: </span>'
+        f'<strong style="color:#1e40af;">{nome_aba_preview}</strong>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<div style='height:0.3rem'></div>", unsafe_allow_html=True)
+
+    if st.button("Processar Fluxo de Caixa", key="ca_btn", use_container_width=True, type="primary"):
+        with st.spinner("Consolidando e preenchendo a planilha…"):
+            temp_receitas = None
+            try:
+                temp_receitas = os.path.join(
+                    tempfile.gettempdir(), f"mv_ca_{arquivo_receitas.name}"
+                )
+                with open(temp_receitas, "wb") as f:
+                    f.write(arquivo_receitas.getbuffer())
+
+                lista_fluxos = [(arq.name, arq.getvalue()) for arq in arquivos_fluxo]
+
+                saida, dias_processados, total_rec, total_desp = processar_conta_azul(
+                    temp_receitas, lista_fluxos, int(mes), int(ano)
+                )
+
+                st.markdown("---")
+                st.markdown("#### Resultado")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Dias com dados", dias_processados)
+                m2.metric("Total Receitas", f"R$ {total_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                m3.metric("Total Despesas", f"R$ {total_desp:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+                st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+
+                nome_mes_label = MESES_PT.get(int(mes), str(mes))
+                st.markdown(
+                    f'<div style="background:rgba(59,130,246,0.06);border:1px solid rgba(59,130,246,0.15);'
+                    f'border-radius:10px;padding:12px 16px;margin:0.5rem 0;">'
+                    f'<span style="font-weight:600;color:#1e40af;">📊 {nome_mes_label}/{ano}</span>'
+                    f'<span style="color:#64748b;font-size:0.85rem;"> — '
+                    f'{len(arquivos_fluxo)} arquivo(s) de fluxo consolidado(s) | '
+                    f'Aba <strong>{nome_aba_preview}</strong> criada</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+                with open(saida, "rb") as f:
+                    st.download_button(
+                        "⬇  Baixar Planilha de Receitas Atualizada",
+                        f,
+                        file_name=os.path.basename(saida),
+                        use_container_width=True,
+                    )
+
+            except Exception as e:
+                st.error(f"Erro ao processar: {str(e)}")
+            finally:
+                if temp_receitas and os.path.exists(temp_receitas):
+                    os.remove(temp_receitas)
 
 
 # ═══════════════════════════════════════════
@@ -796,7 +1304,6 @@ def tela_principal():
         </div>
     """, unsafe_allow_html=True)
 
-    # Botão de logout na sidebar
     with st.sidebar:
         st.markdown(f"**Logado como:** {nome}")
         st.markdown(f"**Perfil:** {st.session_state.get('perfil', 'operador').title()}")
@@ -806,7 +1313,7 @@ def tela_principal():
                 st.session_state.pop(key, None)
             st.rerun()
 
-    tab1, tab2 = st.tabs(["Empréstimos Individuais", "Empréstimos"])
+    tab1, tab2, tab3 = st.tabs(["Empréstimos Individuais", "Empréstimos", "Conta Azul"])
 
     with tab1:
         bloco_processamento(
@@ -821,6 +1328,9 @@ def tela_principal():
             descricao="Incrementa coluna F — se F = D após incremento, marca como quitado",
             funcao_processar=processar_planilha_coluna_f,
         )
+
+    with tab3:
+        bloco_conta_azul()
 
 
 # ═══════════════════════════════════════════
